@@ -1,5 +1,6 @@
 """
 Multi-reach canal network assembling interconnected hydraulic pools and ODEs.
+Includes smooth physical transitions to eliminate numerical interpolation ringing.
 """
 from typing import List, Tuple
 import numpy as np
@@ -21,6 +22,29 @@ class CanalNetwork:
             SluiceGate(gate_width=3.5, cd=0.60),   # Gate 1: Cross-Regulator 1 (R1 -> R2)
             SluiceGate(gate_width=3.0, cd=0.60)    # Gate 2: Cross-Regulator 2 (R2 -> R3)
         ]
+
+    def _smooth_theft_profile(
+        self,
+        t: float,
+        theft_rate: float = 2.5,
+        theft_window: Tuple[float, float] = (8.0, 16.0),
+        ramp_tau: float = 300.0  # 5-minute physical ramp-up time constant
+    ) -> float:
+        """
+        Computes a C^infinity smooth logistic transition for water theft,
+        eliminating numerical RK45 polynomial ringing artifacts.
+        """
+        t_start = theft_window[0] * 3600.0
+        t_end = theft_window[1] * 3600.0
+
+        # Safe sigmoid calculation to prevent numerical overflow
+        def sigmoid(val):
+            val_clipped = np.clip(val, -50.0, 50.0)
+            return 1.0 / (1.0 + np.exp(-val_clipped))
+
+        turn_on = sigmoid((t - t_start) / ramp_tau)
+        turn_off = sigmoid((t - t_end) / ramp_tau)
+        return float(theft_rate * turn_on * (1.0 - turn_off))
 
     def system_derivatives(
         self,
@@ -51,11 +75,10 @@ class CanalNetwork:
         Q_s2 = self.reaches[1].seepage_loss(h2)
         Q_s3 = self.reaches[2].seepage_loss(h3)
 
-        # 3. Theft event
+        # 3. Smooth Physical Theft Profile
         Q_theft = 0.0
-        t_hours = t / 3600.0
-        if theft_active and (theft_window[0] <= t_hours <= theft_window[1]):
-            Q_theft = theft_rate
+        if theft_active:
+            Q_theft = self._smooth_theft_profile(t, theft_rate, theft_window)
 
         # 4. ODEs: dh/dt
         dh1_dt = (Q_in1 - Q_gate1 - Q_moga1 - Q_s1) / self.reaches[0].surface_area(h1)
@@ -77,7 +100,7 @@ class CanalNetwork:
         gate_openings: List[float] = [1.2, 0.85, 0.75],
         theft_active: bool = True
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Finds steady-state equilibrium first, then runs transient simulation."""
+        """Runs the simulation with a maximum step size to ensure smooth trajectory."""
         h_eq = self.find_steady_state(inflow, gate_openings)
         t_span = (0.0, duration_hours * 3600.0)
         t_eval = np.linspace(0.0, duration_hours * 3600.0, 600)
@@ -85,5 +108,7 @@ class CanalNetwork:
         ode_wrapper = lambda t, h: self.system_derivatives(
             t, h, gate_openings, inflow, theft_active=theft_active
         )
-        sol = solve_ivp(ode_wrapper, t_span, h_eq, t_eval=t_eval, method="RK45")
+        
+        # max_step=120s forces RK45 to sample accurately through transition windows
+        sol = solve_ivp(ode_wrapper, t_span, h_eq, t_eval=t_eval, method="RK45", max_step=120.0)
         return sol.t / 3600.0, sol.y, h_eq
